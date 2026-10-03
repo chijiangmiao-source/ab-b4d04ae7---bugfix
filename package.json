@@ -1,0 +1,17 @@
+{
+  "name": "isolation-token-review",
+  "version": "1.0.0",
+  "private": true,
+  "description": "航电维护脚本隔离令牌离线穷尽复核（零依赖 Node.js）",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "build": "node scripts/build.js",
+    "test": "node --test tests/",
+    "verify": "node scripts/verify.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "UNLICENSED"
+}

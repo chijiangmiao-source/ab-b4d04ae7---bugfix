@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>航电隔离令牌 · 离线复核台</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">✈</span>
+    <div>
+      <h1>航电维护脚本 · 隔离令牌离线复核</h1>
+      <p class="sub">穷尽全部控制路径 · 追踪持有令牌与待执行清理续体 · 离线运行无外发</p>
+    </div>
+  </div>
+  <div id="health" class="health" title="健康检查">健康检查中…</div>
+</header>
+
+<main>
+  <section class="card">
+    <div class="card-head">
+      <h2>① 令牌登记（1–8 个）</h2>
+      <div class="row-actions">
+        <button type="button" id="add-token" class="btn">＋ 增加令牌</button>
+      </div>
+    </div>
+    <div id="token-list" class="token-list"></div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>② 结构化指令（至多 96 条）</h2>
+      <div class="row-actions">
+        <button type="button" id="add-row" class="btn">＋ 增加指令</button>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table class="instr-table">
+        <thead>
+          <tr>
+            <th class="col-line">#</th>
+            <th class="col-op">指令</th>
+            <th class="col-token">令牌</th>
+            <th class="col-bound">循环上界</th>
+            <th class="col-del"></th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card actions">
+    <button type="button" id="submit" class="btn btn-primary">提交复核</button>
+    <button type="button" id="clear" class="btn btn-danger">清空草稿与结论</button>
+    <span id="draft-count" class="muted"></span>
+  </section>
+
+  <section id="conclusion" class="conclusion" aria-live="polite"></section>
+
+  <section class="card help">
+    <h2>语义说明</h2>
+    <ul>
+      <li><b>acquire（获取）</b>：令牌须当前未持有，执行后持有；重复获取即违规（循环体内未释放会在第二轮暴露）。</li>
+      <li><b>act（操作）/ release（释放）</b>：只能作用于当前持有令牌；release 后令牌不再持有。</li>
+      <li><b>if（条件分支）</b>：复核将条件按两种结果展开——结果①判定成立（该路径确认令牌持有）进入 THEN；结果②判定不成立（已持有令牌保持不变）进入 ELSE 或跳过 THEN。可使用 ELSE 指令分隔两支。</li>
+      <li><b>loop（有限次数循环）</b>：循环体按上界逐轮展开（上界 ≤ 64），每轮状态独立追踪。</li>
+      <li><b>cleanup（清理块）… end</b>：正常流中内联跳过其主体并注册为待执行清理续体；return / abort / 脚本结束离开前按后进先出（LIFO）全部展开；支持嵌套清理块。</li>
+      <li><b>return（返回）/ abort（中止）</b>：离开脚本前必须完成全部已注册清理，且清理结束后不得残留持有令牌；二者禁止出现在清理块内部（非法跳出清理作用域）。</li>
+      <li>发现违规时给出<b>最短指令步数</b>、同长度保持源序（THEN 先于 ELSE）的完整逐步路径；安全时给出已穷尽的规范状态数与各出口的清理结果。</li>
+    </ul>
+  </section>
+</main>
+
+<template id="tpl-error">
+  <div class="result result-error">
+    <h3>⛔ 无法复核：草稿存在结构性错误（旧证据已移除）</h3>
+    <p class="big" data-field="message"></p>
+    <p class="muted" data-field="code"></p>
+  </div>
+</template>
+
+<template id="tpl-violation">
+  <div class="result result-violation">
+    <h3>⛔ 复核结论：发现违规</h3>
+    <p class="big" data-field="message"></p>
+    <p class="muted">
+      违规码 <code data-field="code"></code>
+      ｜最短路径步数 <b data-field="pathLength"></b>
+      <span data-field="lineWrap">｜定位行 <b data-field="line"></b></span>
+    </p>
+    <div class="table-wrap">
+      <table class="path-table">
+        <thead>
+          <tr>
+            <th>步</th><th>行</th><th>指令</th><th>令牌</th><th>分支/轮次</th>
+            <th>持有令牌 前 → 后</th><th>待执行清理续体 前 → 后</th><th>说明</th>
+          </tr>
+        </thead>
+        <tbody data-field="steps"></tbody>
+      </table>
+    </div>
+  </div>
+</template>
+
+<template id="tpl-safe">
+  <div class="result result-safe">
+    <h3>✅ 复核结论：全部路径安全（已穷尽）</h3>
+    <div class="stat-grid">
+      <div class="stat"><span data-field="canonicalStates"></span><label>规范状态数</label></div>
+      <div class="stat"><span data-field="transitions"></span><label>展开迁移数</label></div>
+      <div class="stat"><span data-field="instructionCount"></span><label>有效指令数</label></div>
+      <div class="stat"><span data-field="tokenCount"></span><label>令牌数</label></div>
+      <div class="stat"><span data-field="exitCount"></span><label>出口种类</label></div>
+    </div>
+    <h4>各出口清理结果</h4>
+    <div class="table-wrap">
+      <table class="exit-table">
+        <thead><tr><th>出口</th><th>触发位置</th><th>清理中释放</th><th>到达该出口的规范路径数</th></tr></thead>
+        <tbody data-field="exits"></tbody>
+      </table>
+    </div>
+  </div>
+</template>
+
+<script src="/app.js"></script>
+</body>
+</html>

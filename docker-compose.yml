@@ -1,0 +1,43 @@
+# Compose 编排：
+#   review —— 长驻复核服务，提供复核页与健康地址（宿主端口可配置）
+#   verify —— 一次性验收服务：代码测试 + 构建页面 + HTTP 冒烟 + 三场景复核，
+#             执行后退出并以退出码报告结果
+#
+# 常用命令：
+#   REVIEW_PORT=9090 docker compose up --build        # 启动复核页 http://localhost:9090/
+#   docker compose run --rm verify                    # 单独执行一次性验收
+#   docker compose up --build verify                  # 编排方式执行验收（自动等待 review 健康）
+
+services:
+  review:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: isolation-token-review:latest
+    command: ["node", "src/server.js"]
+    environment:
+      PORT: "8080"
+      HOST: "0.0.0.0"
+    ports:
+      # 宿主端口通过 REVIEW_PORT 配置，默认 8080
+      - "${REVIEW_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+    restart: unless-stopped
+
+  verify:
+    image: isolation-token-review:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["node", "scripts/verify.js", "--base", "http://review:8080"]
+    environment:
+      PORT: "8080"
+    depends_on:
+      review:
+        condition: service_healthy
+    restart: "no"
