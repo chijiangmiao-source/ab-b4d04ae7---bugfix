@@ -179,6 +179,24 @@ async function main() {
           && d.result.violation.code === 'DUP_ACQUIRE',
       },
       {
+        name: '回归 · 三层嵌套均取上界 64（8 条指令，内层获取后立即释放）',
+        tokens: ['A'],
+        instructions: [
+          { op: 'loop', bound: 64 },
+          { op: 'loop', bound: 64 },
+          { op: 'loop', bound: 64 },
+          { op: 'acquire', token: 'A' },
+          { op: 'release', token: 'A' },
+          { op: 'end' },
+          { op: 'end' },
+          { op: 'end' },
+        ],
+        expect: (d) => d.ok && d.result.safe === true
+          && d.result.exits.length === 1
+          && d.result.exits[0].kind === 'implicit'
+          && d.result.stats.canonicalStates > 120000,
+      },
+      {
         name: '结构性错误 · 未知令牌报错并移除旧证据',
         tokens: ['ISO-A'],
         instructions: [{ op: 'acquire', token: 'GHOST' }],

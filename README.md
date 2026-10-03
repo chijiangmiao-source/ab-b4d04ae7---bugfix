@@ -38,7 +38,7 @@ src/server.js      零依赖 HTTP 服务（复核页 + /api/review + /health）
 web-src/           复核页源码（原生 HTML/CSS/JS，无构建框架）
 scripts/build.js   页面构建：拷贝并语法校验 -> public/
 scripts/verify.js  一次性验收服务 verify
-tests/             node:test 代码测试（16 项，含三大必测场景）
+tests/             node:test 代码测试（18 项，含三大必测场景与三层 64 回归）
 ```
 
 ## 本地运行（无需 Docker）

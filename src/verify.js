@@ -34,6 +34,12 @@
 // the first violation witness is shortest in executed instruction steps and,
 // among equal-length witnesses, earliest in source order (THEN before ELSE,
 // loop body before loop exit).
+//
+// A legal script can legitimately expand to ~1e6 canonical states (three
+// nested loops at the public bound of 64). Rows therefore live in packed
+// typed arrays (~40 bytes/state) with hash-consed persistent stacks; the rich
+// step objects rendered for a violation witness are reconstructed only on
+// demand by walking parent rows.
 
 const { normalizeTokens, parseInstructions, makeError } = require('./instr');
 
@@ -94,323 +100,395 @@ function analyze(rawTokens, rawRows) {
   const n = instrs.length;
   const endOf = (idx) => instrs[idx].endIndex;
   const heldNames = (mask) => tokens.filter((_, i) => mask & (1 << i));
-  const pendingNames = (pending) => pending.map((h) => `L${instrs[h].line}`);
 
-  // state:
-  //   phase   : 'run' normal flow | 'clean' executing a continuation body
-  //   pc      : next instruction index (run: program-wide; clean: body index)
-  //   bodyEnd : exclusive end index while in clean mode
-  //   mask    : held token bits
-  //   pending : LIFO stack of cleanup head indices
-  //   loops   : [[headIndex, iterationsDone]] for currently open loops
-  //   kind/trigger : exit kind that initiated the current unwind
-  const start = {
-    phase: 'run', pc: 0, bodyEnd: -1, mask: 0,
-    pending: [], loops: [], kind: null, trigger: null,
+  // ---- packed encodings ----
+  const PHASE_RUN = 0;
+  const PHASE_CLEAN = 1;
+  const KIND_NONE = 0;
+  const KIND_RETURN = 1;
+  const KIND_ABORT = 2;
+  const KIND_IMPLICIT = 3;
+  const KIND_OF = { return: KIND_RETURN, abort: KIND_ABORT, implicit: KIND_IMPLICIT };
+  const NAME_OF = { [KIND_RETURN]: 'return', [KIND_ABORT]: 'abort', [KIND_IMPLICIT]: 'implicit' };
+  // Why the successor row exists — selects witness reconstruction detail.
+  const EDGE_PLAIN = 0;
+  const EDGE_LOOP_ENTER = 1;
+  const EDGE_IF_TRUE = 2;
+  const EDGE_IF_FALSE = 3;
+  const EDGE_CONTINUE = 4;
+
+  // Interned loop-counter stacks (immutable linked sequences, empty = -1):
+  // each ref stores { head: loop-head instruction index,
+  //                  count: iterations already done, tail: older ref }.
+  // Hash consing makes structurally equal stacks share one id across paths.
+  const loopsMap = new Map();
+  const loopsHead = [];
+  const loopsCount = [];
+  const loopsTail = [];
+  function loopsCons(tail, head, count) {
+    const key = `${tail}|${head}|${count}`;
+    const hit = loopsMap.get(key);
+    if (hit !== undefined) return hit;
+    const ref = loopsHead.length;
+    loopsMap.set(key, ref);
+    loopsHead.push(head);
+    loopsCount.push(count);
+    loopsTail.push(tail);
+    return ref;
+  }
+  function loopsCounter(ref, head) {
+    for (let r = ref; r >= 0; r = loopsTail[r]) {
+      if (loopsHead[r] === head) return loopsCount[r];
+    }
+    return 0;
+  }
+  // Stack copy with one loop head removed, rebuilt through the cons table so
+  // the remainder is shared with every other path holding the same counters.
+  function loopsWithout(ref, dropped) {
+    const kept = []; // traversal is inner -> outer
+    for (let r = ref; r >= 0; r = loopsTail[r]) {
+      if (loopsHead[r] !== dropped) kept.push([loopsHead[r], loopsCount[r]]);
+    }
+    let out = -1;
+    for (let i = kept.length - 1; i >= 0; i--) {
+      out = loopsCons(out, kept[i][0], kept[i][1]);
+    }
+    return out;
+  }
+
+  // Interned pending-continuation stacks (empty = -1); entries hold a cleanup
+  // head instruction index.
+  const pendingMap = new Map();
+  const pendingHead = [];
+  const pendingTail = [];
+  function pendingCons(tail, head) {
+    const key = `${tail}|${head}`;
+    const hit = pendingMap.get(key);
+    if (hit !== undefined) return hit;
+    const ref = pendingHead.length;
+    pendingMap.set(key, ref);
+    pendingHead.push(head);
+    pendingTail.push(tail);
+    return ref;
+  }
+  function pendingNames(ref) {
+    const out = [];
+    for (let r = ref; r >= 0; r = pendingTail[r]) {
+      out.push(`L${instrs[pendingHead[r]].line}`);
+    }
+    return out.reverse();
+  }
+
+  // Canonical-state rows, grown on demand.
+  const STATE_BUDGET = 3000000;
+  let cap = 4096;
+  let rows = 0;
+  const col = {
+    par: new Int32Array(cap),     // parent row (-1 for the start row)
+    pc: new Int32Array(cap),      // next instruction to execute
+    bodyEnd: new Int32Array(cap), // exclusive body end while in clean mode
+    stepPc: new Int32Array(cap),  // instruction whose execution made this row
+    mask: new Uint32Array(cap),   // held-token bits
+    loops: new Int32Array(cap),   // interned loop-counter stack ref
+    pending: new Int32Array(cap), // interned continuation stack ref
+    trigger: new Int32Array(cap), // exit trigger line (-1 = none / implicit)
+    kind: new Uint8Array(cap),    // exit kind during unwind (KIND_*)
+    phase: new Uint8Array(cap),   // PHASE_RUN / PHASE_CLEAN
+    edge: new Uint8Array(cap),    // EDGE_* kind of the incoming edge
+    marker: new Uint8Array(cap),  // 1: exit marker precedes this row's step
   };
-
-  const keyOf = (s) =>
-    `${s.phase}|${s.pc}|${s.bodyEnd}|${s.mask}|${s.pending.join('.')}|` +
-    `${s.loops.map(([h, c]) => `${h}:${c}`).join('.')}|${s.kind}|${s.trigger}`;
-
-  const clone = (s, patch) => {
-    const next = Object.assign({}, s);
-    next.pending = (patch && Object.prototype.hasOwnProperty.call(patch, 'pending'))
-      ? patch.pending.slice()
-      : s.pending.slice();
-    next.loops = (patch && Object.prototype.hasOwnProperty.call(patch, 'loops'))
-      ? patch.loops.map((x) => x.slice())
-      : s.loops.map((x) => x.slice());
-    if (patch) Object.assign(next, patch);
-    return next;
-  };
-  const go = (s, pc) => clone(s, { pc });
-  const counterOf = (s, head) => {
-    const f = s.loops.find(([h]) => h === head);
-    return f ? f[1] : 0;
-  };
-  const dropCounter = (s, head) => {
-    const next = clone(s, {});
-    next.loops = next.loops.filter(([h]) => h !== head);
-    return next;
-  };
-
-  // expand() returns exactly one of:
-  //   { edges: [{ state, step, triggerStep? }] }
-  //   { violation: { code, message, line, step } }
-  //   { terminal: { kind, triggerLine } }
-  function expand(s) {
-    const atEnd = s.phase === 'run' ? s.pc >= n : s.pc >= s.bodyEnd;
-    if (atEnd) return segmentEnded(s);
-
-    const ins = instrs[s.pc];
-    const stepBase = {
-      line: ins.line,
-      op: ins.op,
-      label: OP_LABEL[ins.op],
-      token: ins.token || null,
-      phase: s.phase,
-      heldBefore: heldNames(s.mask),
-      heldAfter: heldNames(s.mask),
-      pendingBefore: pendingNames(s.pending),
-      pendingAfter: pendingNames(s.pending),
-    };
-    const one = (next, extra, triggerStep) =>
-      ({ edges: [{ state: next, step: Object.assign({}, stepBase, extra), triggerStep: triggerStep || null }] });
-    const fail = (code, message, extra) => ({
-      violation: { code, message, line: ins.line, step: Object.assign({}, stepBase, extra) },
-    });
-
-    switch (ins.op) {
-      case 'acquire': {
-        if (s.mask & bit.get(ins.token)) {
-          return fail('DUP_ACQUIRE', `重复获取令牌 ${ins.token}：该令牌已处于持有状态`, {
-            detail: `尝试获取已持有的 ${ins.token}`, outcome: '违规',
-          });
-        }
-        const mask = s.mask | bit.get(ins.token);
-        return one(go(clone(s, { mask }), s.pc + 1), {
-          heldAfter: heldNames(mask),
-          detail: `持有集合: ${fmt(stepBase.heldBefore)} → ${fmt(heldNames(mask))}`,
-        });
-      }
-      case 'act':
-      case 'release': {
-        if (!(s.mask & bit.get(ins.token))) {
-          return fail(
-            ins.op === 'act' ? 'USE_NOT_HELD' : 'RELEASE_NOT_HELD',
-            `${OP_LABEL[ins.op]}未持有令牌 ${ins.token}：操作或释放只能作用于当前持有令牌`,
-            { detail: `尝试${OP_LABEL[ins.op]}未持有的 ${ins.token}`, outcome: '违规' },
-          );
-        }
-        const mask = ins.op === 'release' ? s.mask & ~bit.get(ins.token) : s.mask;
-        return one(go(clone(s, { mask }), s.pc + 1), {
-          heldAfter: heldNames(mask),
-          detail: `持有集合: ${fmt(stepBase.heldBefore)} → ${fmt(heldNames(mask))}`,
-        });
-      }
-      case 'if': {
-        // Both outcomes are ALWAYS expanded (exhaustive review).
-        // ① true : the condition confirms T is held -> set T's bit; THEN arm
-        //    may therefore act/release T without a preceding acquire.
-        // ② false: skip the THEN arm (jump to ELSE arm or past END); tokens
-        //    acquired earlier remain held, so a release that exists only in
-        //    the THEN arm is detected as a leak on this path.
-        // Edges are emitted in source order (true first).
-        const tbit = bit.get(ins.token);
-        const trueMask = s.mask | tbit;
-        const edges = [];
-        edges.push({
-          state: go(clone(s, { mask: trueMask }), s.pc + 1),
-          step: Object.assign({}, stepBase, {
-            branch: 'true',
-            heldAfter: heldNames(trueMask),
-            detail: `条件 ${ins.token} 按结果①展开：判定成立，${ins.token} 确认持有，进入 THEN 分支`,
-          }),
-          triggerStep: null,
-        });
-        const target = ins.elseIndex >= 0 ? ins.elseIndex + 1 : endOf(s.pc) + 1;
-        edges.push({
-          state: go(s, target),
-          step: Object.assign({}, stepBase, {
-            branch: 'false',
-            heldAfter: stepBase.heldBefore,
-            detail: ins.elseIndex >= 0
-              ? `条件 ${ins.token} 按结果②展开：判定不成立，已持有令牌保持不变，进入 ELSE 分支`
-              : `条件 ${ins.token} 按结果②展开：判定不成立，已持有令牌保持不变，跳过 THEN 分支`,
-          }),
-          triggerStep: null,
-        });
-        return { edges };
-      }
-      case 'loop': {
-        const k = counterOf(s, s.pc);
-        if (k < ins.bound) {
-          return one(go(s, s.pc + 1), {
-            iteration: k + 1,
-            detail: `进入循环第 ${k + 1}/${ins.bound} 轮`,
-          });
-        }
-        return one(go(dropCounter(s, s.pc), endOf(s.pc) + 1), {
-          detail: `已完成 ${ins.bound} 轮循环，退出循环`,
-        });
-      }
-      case 'end': {
-        if (ins.kind === 'loop') {
-          const head = ins.headIndex;
-          const k = counterOf(s, head);
-          const next = clone(s, {});
-          next.loops = next.loops.filter(([h]) => h !== head);
-          next.loops.push([head, k + 1]);
-          return one(go(next, head), {
-            detail: `循环体第 ${k + 1} 轮结束，回到循环头`,
-          });
-        }
-        return one(go(s, s.pc + 1), { detail: '条件分支结束' });
-      }
-      case 'else':
-        return one(go(s, ins.endIndex + 1), { detail: '跳过 ELSE 分支' });
-      case 'cleanup': {
-        const pending = s.pending.concat(s.pc);
-        const next = clone(s, { pending });
-        return one(go(next, endOf(s.pc) + 1), {
-          pendingAfter: pendingNames(pending),
-          detail: `注册清理续体 L${ins.line}（内联跳过主体），续体栈: ${fmt(pendingNames(pending))}`,
-        });
-      }
-      case 'return':
-      case 'abort':
-        return beginExit(s, ins.op, ins.line);
-      default:
-        throw makeError('INTERNAL', `未实现的指令 ${ins.op}`, ins.line);
+  function growColumns() {
+    cap *= 2;
+    for (const k of Object.keys(col)) {
+      const next = new col[k].constructor(cap);
+      next.set(col[k]);
+      col[k] = next;
     }
   }
 
-  function exitStep(s, kind, triggerLine) {
+  const seen = new Map(); // canonical key -> row id
+  const queue = [];       // BFS FIFO (qhead index avoids Array#shift cost)
+  let qhead = 0;
+
+  // Successor frame; `kind`/`trigger` are string/null on the way in.
+  // intern() deduplicates canonically equal frames and schedules fresh rows.
+  function intern(f, parent) {
+    const kindCode = f.kind ? KIND_OF[f.kind] : KIND_NONE;
+    const trig = f.trigger == null ? -1 : f.trigger;
+    const key =
+      `${f.phase}|${f.pc}|${f.bodyEnd}|${f.mask}|${f.pending}|${f.loops}|${kindCode}|${trig}`;
+    const hit = seen.get(key);
+    if (hit !== undefined) return hit;
+    if (rows >= STATE_BUDGET) {
+      throw makeError(
+        'STATE_BUDGET',
+        `穷尽展开超过 ${STATE_BUDGET} 个规范状态（嵌套循环上界乘积过大），请调小循环次数`,
+      );
+    }
+    if (rows === col.par.length) growColumns();
+    const id = rows++;
+    col.par[id] = parent;
+    col.pc[id] = f.pc;
+    col.bodyEnd[id] = f.bodyEnd;
+    col.stepPc[id] = f.stepPc;
+    col.mask[id] = f.mask;
+    col.loops[id] = f.loops;
+    col.pending[id] = f.pending;
+    col.kind[id] = kindCode;
+    col.trigger[id] = trig;
+    col.phase[id] = f.phase;
+    col.edge[id] = f.edge;
+    col.marker[id] = f.marker ? 1 : 0;
+    seen.set(key, id);
+    queue.push(id);
+    return id;
+  }
+
+  function triggerOf(id) {
+    return col.trigger[id] === -1 ? null : col.trigger[id];
+  }
+  function kindOf(id) {
+    return col.kind[id] === KIND_NONE ? null : NAME_OF[col.kind[id]];
+  }
+
+  // Rich exit marker (return / abort / implicit unwind start). It always
+  // originates in run mode and precedes the first continuation expansion.
+  function markerStep(id, kind, trigger) {
+    const names = heldNames(col.mask[id]);
+    const pend = pendingNames(col.pending[id]);
     return {
-      line: triggerLine,
+      line: trigger,
       op: kind,
       label: OP_LABEL[kind],
       token: null,
-      phase: s.phase,
-      heldBefore: heldNames(s.mask),
-      heldAfter: heldNames(s.mask),
-      pendingBefore: pendingNames(s.pending),
-      pendingAfter: pendingNames(s.pending),
+      phase: 'run',
+      heldBefore: names,
+      heldAfter: names,
+      pendingBefore: pend,
+      pendingAfter: pend,
       detail: kind === 'implicit'
         ? '控制流到达脚本末尾，开始后进先出展开清理续体'
         : `${OP_LABEL[kind]}离开脚本，开始后进先出展开清理续体`,
     };
   }
 
-  function continuationStep(s, head, pending) {
-    return {
-      line: instrs[head].line,
-      op: 'cleanup',
-      label: '展开清理',
-      token: null,
-      phase: 'clean',
-      cleanupExpand: true,
-      heldBefore: heldNames(s.mask),
-      heldAfter: heldNames(s.mask),
-      pendingBefore: pendingNames(s.pending),
-      pendingAfter: pendingNames(pending),
-      detail: `展开清理续体 L${instrs[head].line}，剩余待执行: ${fmt(pendingNames(pending))}`,
-    };
-  }
-
-  function beginExit(s, kind, triggerLine) {
-    const marker = exitStep(s, kind, triggerLine);
-    return unwind(s, kind, triggerLine, marker);
-  }
-
-  // Run-mode flow fell off the script, or a clean-mode body finished.
-  function segmentEnded(s) {
-    if (s.phase === 'clean') {
-      if (s.pending.length === 0) return terminal(s);
-      const head = s.pending[s.pending.length - 1];
-      const pending = s.pending.slice(0, -1);
-      const next = clone(s, { phase: 'clean', pc: head + 1, bodyEnd: endOf(head), pending });
-      return { edges: [{ state: next, step: continuationStep(s, head, pending), triggerStep: null }] };
-    }
-    return unwind(s, 'implicit', null, exitStep(s, 'implicit', null));
-  }
-
-  function unwind(s, kind, trigger, marker) {
-    if (s.pending.length === 0) return terminal(s, marker);
-    const head = s.pending[s.pending.length - 1];
-    const pending = s.pending.slice(0, -1);
-    const next = clone(s, {
-      phase: 'clean', pc: head + 1, bodyEnd: endOf(head), pending, kind, trigger,
-    });
-    // marker (return/abort/implicit-exit) precedes the first expansion.
-    return { edges: [{ state: next, step: continuationStep(s, head, pending), triggerStep: marker }] };
-  }
-
-  function terminal(s, marker) {
-    const remain = heldNames(s.mask);
+  // All continuations finished: safe exit, or held tokens left behind.
+  // marker is the rich exit step when the unwind starts here, or null for a
+  // continuation chain whose marker is recorded on an ancestor row.
+  function terminalOrLeak(id, kind, trigger, marker) {
+    const remain = heldNames(col.mask[id]);
     if (remain.length) {
       return {
         violation: {
           code: 'LEAK_ON_EXIT',
-          message: `${exitLabel(s.kind || 'implicit')}完成全部清理后仍持有令牌 ${remain.join('、')}，隔离状态泄漏`,
-          line: s.trigger,
-          step: marker || null,
+          message: `${exitLabel(kind)}完成全部清理后仍持有令牌 ${remain.join('、')}，隔离状态泄漏`,
+          line: trigger,
+          step: marker,
         },
       };
     }
-    return { terminal: { kind: s.kind || 'implicit', triggerLine: s.trigger } };
+    return { terminal: { kind, triggerLine: trigger } };
   }
 
-  // ---- BFS with parent tracking ----
-  const STATE_BUDGET = 120000;
-  const queue = [start];
-  const seen = new Map(); // key -> { state, parentKey, step, triggerStep }
-  seen.set(keyOf(start), { state: start, parentKey: null, step: null, triggerStep: null });
+  // Edge into the next pending continuation body (LIFO unwind).
+  function continuationEdge(id, kind, trigger, withMarker) {
+    const pend = col.pending[id];
+    const head = pendingHead[pend];
+    return {
+      edges: [{
+        phase: PHASE_CLEAN,
+        pc: head + 1,
+        bodyEnd: endOf(head),
+        stepPc: head,
+        mask: col.mask[id],
+        loops: col.loops[id],
+        pending: pendingTail[pend],
+        kind,
+        trigger,
+        edge: EDGE_CONTINUE,
+        marker: withMarker,
+      }],
+    };
+  }
+
+  function beginExit(id, kind, trigger) {
+    if (col.pending[id] === -1) {
+      return terminalOrLeak(id, kind, trigger, markerStep(id, kind, trigger));
+    }
+    return continuationEdge(id, kind, trigger, 1);
+  }
+
+  // Run-mode flow fell off the script, or a clean-mode body finished.
+  function segmentEnded(id) {
+    if (col.phase[id] === PHASE_CLEAN) {
+      const kind = kindOf(id);
+      if (col.pending[id] === -1) return terminalOrLeak(id, kind, triggerOf(id), null);
+      return continuationEdge(id, kind, triggerOf(id), 0);
+    }
+    if (col.pending[id] === -1) {
+      return terminalOrLeak(id, 'implicit', null, markerStep(id, 'implicit', null));
+    }
+    return continuationEdge(id, 'implicit', null, 1);
+  }
+
+  function fail(id, ins, code, message, extra) {
+    const names = heldNames(col.mask[id]);
+    const pend = pendingNames(col.pending[id]);
+    return {
+      violation: {
+        code,
+        message,
+        line: ins.line,
+        step: Object.assign({
+          line: ins.line,
+          op: ins.op,
+          label: OP_LABEL[ins.op],
+          token: ins.token || null,
+          phase: col.phase[id] === PHASE_CLEAN ? 'clean' : 'run',
+          heldBefore: names,
+          heldAfter: names,
+          pendingBefore: pend,
+          pendingAfter: pend,
+        }, extra),
+      },
+    };
+  }
+
+  // expand() returns exactly one of:
+  //   { edges: [successorFrame, ...] }
+  //   { violation: { code, message, line, step } }
+  //   { terminal: { kind, triggerLine } }
+  function expand(id) {
+    const pc = col.pc[id];
+    const phase = col.phase[id];
+    const atEnd = phase === PHASE_RUN ? pc >= n : pc >= col.bodyEnd[id];
+    if (atEnd) return segmentEnded(id);
+
+    const ins = instrs[pc];
+    const mask = col.mask[id];
+    // Default successor stays in the same frame with unchanged holdings.
+    const edge = (patch) => Object.assign({
+      phase,
+      pc: pc + 1,
+      bodyEnd: col.bodyEnd[id],
+      stepPc: pc,
+      mask,
+      loops: col.loops[id],
+      pending: col.pending[id],
+      kind: kindOf(id),
+      trigger: triggerOf(id),
+      edge: EDGE_PLAIN,
+      marker: 0,
+    }, patch);
+
+    switch (ins.op) {
+      case 'acquire': {
+        if (mask & bit.get(ins.token)) {
+          return fail(id, ins, 'DUP_ACQUIRE',
+            `重复获取令牌 ${ins.token}：该令牌已处于持有状态`,
+            { detail: `尝试获取已持有的 ${ins.token}`, outcome: '违规' });
+        }
+        return { edges: [edge({ mask: mask | bit.get(ins.token) })] };
+      }
+      case 'act':
+      case 'release': {
+        if (!(mask & bit.get(ins.token))) {
+          return fail(id, ins,
+            ins.op === 'act' ? 'USE_NOT_HELD' : 'RELEASE_NOT_HELD',
+            `${OP_LABEL[ins.op]}未持有令牌 ${ins.token}：操作或释放只能作用于当前持有令牌`,
+            { detail: `尝试${OP_LABEL[ins.op]}未持有的 ${ins.token}`, outcome: '违规' });
+        }
+        const nextMask = ins.op === 'release' ? mask & ~bit.get(ins.token) : mask;
+        return { edges: [edge({ mask: nextMask })] };
+      }
+      case 'if': {
+        // Both outcomes are ALWAYS expanded (exhaustive review), in source
+        // order: ① true confirms T held and enters THEN; ② false skips THEN
+        // (to ELSE or past END) while earlier-acquired tokens stay held.
+        const tbit = bit.get(ins.token);
+        const target = ins.elseIndex >= 0 ? ins.elseIndex + 1 : endOf(pc) + 1;
+        return {
+          edges: [
+            edge({ mask: mask | tbit, edge: EDGE_IF_TRUE }),
+            edge({ pc: target, edge: EDGE_IF_FALSE }),
+          ],
+        };
+      }
+      case 'loop': {
+        const k = loopsCounter(col.loops[id], pc);
+        if (k < ins.bound) return { edges: [edge({ edge: EDGE_LOOP_ENTER })] };
+        return { edges: [edge({ pc: endOf(pc) + 1, loops: loopsWithout(col.loops[id], pc) })] };
+      }
+      case 'end': {
+        if (ins.kind === 'loop') {
+          const head = ins.headIndex;
+          const k = loopsCounter(col.loops[id], head);
+          let nextLoops = loopsWithout(col.loops[id], head);
+          nextLoops = loopsCons(nextLoops, head, k + 1);
+          return { edges: [edge({ pc: head, loops: nextLoops })] };
+        }
+        return { edges: [edge({})] };
+      }
+      case 'else':
+        return { edges: [edge({ pc: ins.endIndex + 1 })] };
+      case 'cleanup':
+        return { edges: [edge({
+          pc: endOf(pc) + 1,
+          pending: pendingCons(col.pending[id], pc),
+        })] };
+      case 'return':
+      case 'abort':
+        return beginExit(id, ins.op, ins.line);
+      default:
+        throw makeError('INTERNAL', `未实现的指令 ${ins.op}`, ins.line);
+    }
+  }
+
+  // ---- BFS ----
+  intern({
+    phase: PHASE_RUN, pc: 0, bodyEnd: -1, stepPc: -1, mask: 0,
+    loops: -1, pending: -1, kind: null, trigger: null,
+    edge: EDGE_PLAIN, marker: 0,
+  }, -1); // row 0
+
   const exits = new Map(); // `${kind}@${trigger}` -> summary
   let edgeCount = 0;
 
-  const releasedOnPath = (key) => {
-    const out = [];
-    let k = key;
-    while (k) {
-      const node = seen.get(k);
-      if (node.step && node.step.op === 'release' && node.step.phase === 'clean') {
-        out.push({ token: node.step.token, line: node.step.line });
-      }
-      k = node.parentKey;
-    }
-    return out;
-  };
+  while (qhead < queue.length) {
+    const id = queue[qhead++];
+    const res = expand(id);
 
-  while (queue.length) {
-    const s = queue.shift();
-    const curKey = keyOf(s);
-    const res = expand(s);
-
-    if (res.violation) return buildViolation(res.violation, seen, curKey);
+    if (res.violation) return buildViolation(id, res.violation);
 
     if (res.terminal) {
-      const id = `${res.terminal.kind}@${res.terminal.triggerLine == null ? 'end' : res.terminal.triggerLine}`;
-      if (!exits.has(id)) {
-        exits.set(id, {
-          kind: res.terminal.kind,
-          triggerLine: res.terminal.triggerLine,
-          released: new Set(),
-          canonicalArrivals: 0,
-        });
+      const t = res.terminal;
+      const eid = `${t.kind}@${t.triggerLine == null ? 'end' : t.triggerLine}`;
+      let rec = exits.get(eid);
+      if (!rec) {
+        rec = { kind: t.kind, triggerLine: t.triggerLine, released: new Set(), canonicalArrivals: 0 };
+        exits.set(eid, rec);
       }
-      const rec = exits.get(id);
       rec.canonicalArrivals += 1;
-      for (const r of releasedOnPath(curKey)) rec.released.add(`${r.token}@L${r.line}`);
+      for (let p = id; p > 0; p = col.par[p]) {
+        if (col.phase[p] !== PHASE_CLEAN) continue;
+        const si = col.stepPc[p];
+        if (si >= 0 && instrs[si].op === 'release') {
+          rec.released.add(`${instrs[si].token}@L${instrs[si].line}`);
+        }
+      }
       continue;
     }
 
-    for (const e of res.edges) {
+    for (const f of res.edges) {
       edgeCount += 1;
-      const k = keyOf(e.state);
-      if (!seen.has(k)) {
-        if (seen.size >= STATE_BUDGET) {
-          throw makeError(
-            'STATE_BUDGET',
-            `穷尽展开超过 ${STATE_BUDGET} 个规范状态（嵌套循环上界乘积过大），请调小循环次数`,
-          );
-        }
-        seen.set(k, {
-          state: e.state,
-          parentKey: curKey,
-          step: e.step,
-          triggerStep: e.triggerStep || null,
-        });
-        queue.push(e.state);
-      }
+      intern(f, id);
     }
   }
 
   return {
     safe: true,
     stats: {
-      canonicalStates: seen.size,
+      canonicalStates: rows,
       transitions: edgeCount,
       instructionCount: n,
       tokenCount: tokens.length,
@@ -427,28 +505,88 @@ function analyze(rawTokens, rawRows) {
     instructions: instrs.map(dumpInstr),
   };
 
-  function buildViolation(v, seenMap, curKey) {
-    // Walk leaf -> root; for each node the trigger marker precedes its step.
-    const reversed = [];
-    let k = curKey;
-    while (k) {
-      const node = seenMap.get(k);
-      if (node.step) reversed.push(node.step);
-      if (node.triggerStep) reversed.push(node.triggerStep);
-      k = node.parentKey;
+  // Reconstruct the rich ordered step list of the first violation by walking
+  // parent rows leaf -> root, then reversing; the exit marker precedes the
+  // first continuation expansion of its unwind.
+  function buildViolation(curId, v) {
+    const leafToRoot = [];
+    for (let id = curId; id > 0; id = col.par[id]) {
+      leafToRoot.push(richStep(id));
+      if (col.marker[id]) {
+        leafToRoot.push(markerStep(col.par[id], NAME_OF[col.kind[id]], triggerOf(id)));
+      }
     }
-    reversed.reverse();
-    if (v.step) reversed.push(v.step);
-    const chain = reversed;
-    chain.forEach((st, i) => { st.seq = i + 1; });
+    leafToRoot.reverse();
+    if (v.step) leafToRoot.push(v.step);
+    leafToRoot.forEach((st, i) => { st.seq = i + 1; });
     return {
       safe: false,
       violation: { code: v.code, message: v.message, line: v.line },
-      pathLength: chain.length,
-      steps: chain,
+      pathLength: leafToRoot.length,
+      steps: leafToRoot,
       tokens,
       instructions: instrs.map(dumpInstr),
     };
+  }
+
+  // Rich step object for the edge that led to row id.
+  function richStep(id) {
+    const parent = col.par[id];
+    const edgeKind = col.edge[id];
+    const isContinue = edgeKind === EDGE_CONTINUE;
+    const headInstr = instrs[col.stepPc[id]];
+    const before = heldNames(col.mask[parent]);
+    const after = heldNames(col.mask[id]);
+    const beforePending = pendingNames(col.pending[parent]);
+    const afterPending = pendingNames(col.pending[id]);
+    const st = {
+      line: headInstr.line,
+      op: isContinue ? 'cleanup' : headInstr.op,
+      label: isContinue ? '展开清理' : OP_LABEL[headInstr.op],
+      token: headInstr.token || null,
+      phase: isContinue || col.phase[parent] === PHASE_CLEAN ? 'clean' : 'run',
+      heldBefore: before,
+      heldAfter: after,
+      pendingBefore: beforePending,
+      pendingAfter: afterPending,
+    };
+    if (isContinue) st.cleanupExpand = true;
+    if (edgeKind === EDGE_IF_TRUE) st.branch = 'true';
+    if (edgeKind === EDGE_IF_FALSE) st.branch = 'false';
+
+    if (isContinue) {
+      st.detail = `展开清理续体 L${headInstr.line}，剩余待执行: ${fmt(afterPending)}`;
+    } else if (headInstr.op === 'acquire' || headInstr.op === 'act' || headInstr.op === 'release') {
+      st.detail = `持有集合: ${fmt(before)} → ${fmt(after)}`;
+    } else if (headInstr.op === 'if') {
+      if (edgeKind === EDGE_IF_TRUE) {
+        st.detail = `条件 ${headInstr.token} 按结果①展开：判定成立，${headInstr.token} 确认持有，进入 THEN 分支`;
+      } else if (headInstr.elseIndex >= 0) {
+        st.detail = `条件 ${headInstr.token} 按结果②展开：判定不成立，已持有令牌保持不变，进入 ELSE 分支`;
+      } else {
+        st.detail = `条件 ${headInstr.token} 按结果②展开：判定不成立，已持有令牌保持不变，跳过 THEN 分支`;
+      }
+    } else if (headInstr.op === 'loop') {
+      if (edgeKind === EDGE_LOOP_ENTER) {
+        const k = loopsCounter(col.loops[id], col.stepPc[id]);
+        st.iteration = k + 1;
+        st.detail = `进入循环第 ${k + 1}/${headInstr.bound} 轮`;
+      } else {
+        st.detail = `已完成 ${headInstr.bound} 轮循环，退出循环`;
+      }
+    } else if (headInstr.op === 'end') {
+      if (headInstr.kind === 'loop') {
+        const k = loopsCounter(col.loops[parent], headInstr.headIndex);
+        st.detail = `循环体第 ${k + 1} 轮结束，回到循环头`;
+      } else {
+        st.detail = '条件分支结束';
+      }
+    } else if (headInstr.op === 'else') {
+      st.detail = '跳过 ELSE 分支';
+    } else if (headInstr.op === 'cleanup') {
+      st.detail = `注册清理续体 L${headInstr.line}（内联跳过主体），续体栈: ${fmt(afterPending)}`;
+    }
+    return st;
   }
 }
 

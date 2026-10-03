@@ -106,6 +106,37 @@ test('场景三(反例)：循环体内获取未释放，第二轮重复获取即
   assert.deepEqual(acquireSteps[1].heldBefore, ['ISO-A']);
 });
 
+test('回归：三层嵌套循环均取公开上界 64，最内层获取后立即释放（8 条指令）-> 穷尽安全', () => {
+  // 该合法脚本的规范状态数超过旧的 120000 状态预算，旧实现在遍历完所有
+  // 64*64*64 个循环组合前即抛出 STATE_BUDGET；修复后必须给出安全结论。
+  const r = analyze(['A'], op([
+    { op: 'loop', bound: 64 },    // 1 外层
+    { op: 'loop', bound: 64 },    // 2 中层
+    { op: 'loop', bound: 64 },    // 3 内层
+    { op: 'acquire', token: 'A' }, // 4
+    { op: 'release', token: 'A' }, // 5 每轮立即释放
+    { op: 'end' },                // 6
+    { op: 'end' },                // 7
+    { op: 'end' },                // 8
+  ]));
+  assert.equal(r.safe, true);
+  assert.equal(r.exits.length, 1);
+  assert.equal(r.exits[0].kind, 'implicit');
+  assert.deepEqual(r.exits[0].released, []);
+  assert.ok(r.stats.canonicalStates > 120000, '必须真正穷尽超过旧预算的状态数');
+  assert.equal(r.stats.transitions, r.stats.canonicalStates - 1);
+});
+
+test('回归：无注册清理时 return/abort 仍按各自出口类型报告（旧实现误记为隐式结束）', () => {
+  for (const op of ['return', 'abort']) {
+    const r = analyze(['A'], [{ op }]);
+    assert.equal(r.safe, true);
+    assert.equal(r.exits.length, 1, `${op} 应恰好产生一个出口`);
+    assert.equal(r.exits[0].kind, op);
+    assert.equal(r.exits[0].triggerLine, 1);
+  }
+});
+
 test('操作未持有令牌被检出', () => {
   const r = analyze(['ISO-A'], [{ op: 'act', token: 'ISO-A' }]);
   assert.equal(r.safe, false);
