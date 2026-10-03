@@ -34,6 +34,15 @@
 // the first violation witness is shortest in executed instruction steps and,
 // among equal-length witnesses, earliest in source order (THEN before ELSE,
 // loop body before loop exit).
+//
+// Storage note: with three nested loops at the public bound of 64 the
+// canonical graph has upwards of 64^3 (about 262k) counter combinations, i.e.
+// over a million states. To keep that tractable, per-node witness steps are
+// stored as compact records (small arrays of integers/references) and only
+// materialized into full step objects when a witness is rebuilt; expanded
+// state objects are released immediately after their edges are generated.
+// The explored graph, its order and every reported result are identical to
+// a naive store-everything traversal.
 
 const { normalizeTokens, parseInstructions, makeError } = require('./instr');
 
@@ -136,7 +145,7 @@ function analyze(rawTokens, rawRows) {
   };
 
   // expand() returns exactly one of:
-  //   { edges: [{ state, step, triggerStep? }] }
+  //   { edges: [{ state, step, triggerRaw? }] }  (compact witness records)
   //   { violation: { code, message, line, step } }
   //   { terminal: { kind, triggerLine } }
   function expand(s) {
@@ -144,21 +153,18 @@ function analyze(rawTokens, rawRows) {
     if (atEnd) return segmentEnded(s);
 
     const ins = instrs[s.pc];
-    const stepBase = {
-      line: ins.line,
-      op: ins.op,
-      label: OP_LABEL[ins.op],
-      token: ins.token || null,
-      phase: s.phase,
-      heldBefore: heldNames(s.mask),
-      heldAfter: heldNames(s.mask),
-      pendingBefore: pendingNames(s.pending),
-      pendingAfter: pendingNames(s.pending),
-    };
-    const one = (next, extra, triggerStep) =>
-      ({ edges: [{ state: next, step: Object.assign({}, stepBase, extra), triggerStep: triggerStep || null }] });
+    // Compact witness records (see storage note above):
+    //   { pc, ph, m, p, e } — pc of the instruction, phase, held mask BEFORE
+    //   the step, pending stack (head indices) BEFORE the step, and an `e`
+    //   bag holding only varying fields: after (held mask after), pa (pending
+    //   stack after), branch, iteration, detail, outcome.
+    // materializeStep() rebuilds the full user-facing step object only when
+    // a violation witness is reported.
+    const rawStep = (s, extra) => ({ pc: s.pc, ph: s.phase, m: s.mask, p: s.pending, e: extra || null });
+    const oneRaw = (next, extra, triggerRaw) =>
+      ({ edges: [{ state: next, step: rawStep(s, extra), triggerRaw: triggerRaw || null }] });
     const fail = (code, message, extra) => ({
-      violation: { code, message, line: ins.line, step: Object.assign({}, stepBase, extra) },
+      violation: { code, message, line: ins.line, step: rawStep(s, extra) },
     });
 
     switch (ins.op) {
@@ -169,9 +175,9 @@ function analyze(rawTokens, rawRows) {
           });
         }
         const mask = s.mask | bit.get(ins.token);
-        return one(go(clone(s, { mask }), s.pc + 1), {
-          heldAfter: heldNames(mask),
-          detail: `持有集合: ${fmt(stepBase.heldBefore)} → ${fmt(heldNames(mask))}`,
+        return oneRaw(go(clone(s, { mask }), s.pc + 1), {
+          after: mask,
+          detail: `持有集合: ${fmt(heldNames(s.mask))} → ${fmt(heldNames(mask))}`,
         });
       }
       case 'act':
@@ -184,9 +190,9 @@ function analyze(rawTokens, rawRows) {
           );
         }
         const mask = ins.op === 'release' ? s.mask & ~bit.get(ins.token) : s.mask;
-        return one(go(clone(s, { mask }), s.pc + 1), {
-          heldAfter: heldNames(mask),
-          detail: `持有集合: ${fmt(stepBase.heldBefore)} → ${fmt(heldNames(mask))}`,
+        return oneRaw(go(clone(s, { mask }), s.pc + 1), {
+          after: mask,
+          detail: `持有集合: ${fmt(heldNames(s.mask))} → ${fmt(heldNames(mask))}`,
         });
       }
       case 'if': {
@@ -202,36 +208,35 @@ function analyze(rawTokens, rawRows) {
         const edges = [];
         edges.push({
           state: go(clone(s, { mask: trueMask }), s.pc + 1),
-          step: Object.assign({}, stepBase, {
+          step: rawStep(s, {
             branch: 'true',
-            heldAfter: heldNames(trueMask),
+            after: trueMask,
             detail: `条件 ${ins.token} 按结果①展开：判定成立，${ins.token} 确认持有，进入 THEN 分支`,
           }),
-          triggerStep: null,
+          triggerRaw: null,
         });
         const target = ins.elseIndex >= 0 ? ins.elseIndex + 1 : endOf(s.pc) + 1;
         edges.push({
           state: go(s, target),
-          step: Object.assign({}, stepBase, {
+          step: rawStep(s, {
             branch: 'false',
-            heldAfter: stepBase.heldBefore,
             detail: ins.elseIndex >= 0
               ? `条件 ${ins.token} 按结果②展开：判定不成立，已持有令牌保持不变，进入 ELSE 分支`
               : `条件 ${ins.token} 按结果②展开：判定不成立，已持有令牌保持不变，跳过 THEN 分支`,
           }),
-          triggerStep: null,
+          triggerRaw: null,
         });
         return { edges };
       }
       case 'loop': {
         const k = counterOf(s, s.pc);
         if (k < ins.bound) {
-          return one(go(s, s.pc + 1), {
+          return oneRaw(go(s, s.pc + 1), {
             iteration: k + 1,
             detail: `进入循环第 ${k + 1}/${ins.bound} 轮`,
           });
         }
-        return one(go(dropCounter(s, s.pc), endOf(s.pc) + 1), {
+        return oneRaw(go(dropCounter(s, s.pc), endOf(s.pc) + 1), {
           detail: `已完成 ${ins.bound} 轮循环，退出循环`,
         });
       }
@@ -242,19 +247,19 @@ function analyze(rawTokens, rawRows) {
           const next = clone(s, {});
           next.loops = next.loops.filter(([h]) => h !== head);
           next.loops.push([head, k + 1]);
-          return one(go(next, head), {
+          return oneRaw(go(next, head), {
             detail: `循环体第 ${k + 1} 轮结束，回到循环头`,
           });
         }
-        return one(go(s, s.pc + 1), { detail: '条件分支结束' });
+        return oneRaw(go(s, s.pc + 1), { detail: '条件分支结束' });
       }
       case 'else':
-        return one(go(s, ins.endIndex + 1), { detail: '跳过 ELSE 分支' });
+        return oneRaw(go(s, ins.endIndex + 1), { detail: '跳过 ELSE 分支' });
       case 'cleanup': {
         const pending = s.pending.concat(s.pc);
         const next = clone(s, { pending });
-        return one(go(next, endOf(s.pc) + 1), {
-          pendingAfter: pendingNames(pending),
+        return oneRaw(go(next, endOf(s.pc) + 1), {
+          pa: pending,
           detail: `注册清理续体 L${ins.line}（内联跳过主体），续体栈: ${fmt(pendingNames(pending))}`,
         });
       }
@@ -266,41 +271,35 @@ function analyze(rawTokens, rawRows) {
     }
   }
 
-  function exitStep(s, kind, triggerLine) {
+  // Exit/continuation records mirror rawStep but carry the exit kind or
+  // cleanup head directly (there is no single program pc for them).
+  function exitRaw(s, kind, triggerLine) {
     return {
+      kind,
       line: triggerLine,
-      op: kind,
-      label: OP_LABEL[kind],
-      token: null,
-      phase: s.phase,
-      heldBefore: heldNames(s.mask),
-      heldAfter: heldNames(s.mask),
-      pendingBefore: pendingNames(s.pending),
-      pendingAfter: pendingNames(s.pending),
+      ph: s.phase,
+      m: s.mask,
+      p: s.pending,
       detail: kind === 'implicit'
         ? '控制流到达脚本末尾，开始后进先出展开清理续体'
         : `${OP_LABEL[kind]}离开脚本，开始后进先出展开清理续体`,
     };
   }
 
-  function continuationStep(s, head, pending) {
+  function continuationRaw(s, head, pending) {
     return {
+      head,
       line: instrs[head].line,
-      op: 'cleanup',
-      label: '展开清理',
-      token: null,
-      phase: 'clean',
-      cleanupExpand: true,
-      heldBefore: heldNames(s.mask),
-      heldAfter: heldNames(s.mask),
-      pendingBefore: pendingNames(s.pending),
-      pendingAfter: pendingNames(pending),
+      ph: 'clean',
+      m: s.mask,
+      p: s.pending,
+      pa: pending,
       detail: `展开清理续体 L${instrs[head].line}，剩余待执行: ${fmt(pendingNames(pending))}`,
     };
   }
 
   function beginExit(s, kind, triggerLine) {
-    const marker = exitStep(s, kind, triggerLine);
+    const marker = exitRaw(s, kind, triggerLine);
     return unwind(s, kind, triggerLine, marker);
   }
 
@@ -311,9 +310,9 @@ function analyze(rawTokens, rawRows) {
       const head = s.pending[s.pending.length - 1];
       const pending = s.pending.slice(0, -1);
       const next = clone(s, { phase: 'clean', pc: head + 1, bodyEnd: endOf(head), pending });
-      return { edges: [{ state: next, step: continuationStep(s, head, pending), triggerStep: null }] };
+      return { edges: [{ state: next, step: continuationRaw(s, head, pending), triggerRaw: null }] };
     }
-    return unwind(s, 'implicit', null, exitStep(s, 'implicit', null));
+    return unwind(s, 'implicit', null, exitRaw(s, 'implicit', null));
   }
 
   function unwind(s, kind, trigger, marker) {
@@ -324,7 +323,7 @@ function analyze(rawTokens, rawRows) {
       phase: 'clean', pc: head + 1, bodyEnd: endOf(head), pending, kind, trigger,
     });
     // marker (return/abort/implicit-exit) precedes the first expansion.
-    return { edges: [{ state: next, step: continuationStep(s, head, pending), triggerStep: marker }] };
+    return { edges: [{ state: next, step: continuationRaw(s, head, pending), triggerRaw: marker }] };
   }
 
   function terminal(s, marker) {
@@ -343,32 +342,83 @@ function analyze(rawTokens, rawRows) {
   }
 
   // ---- BFS with parent tracking ----
-  const STATE_BUDGET = 120000;
+  // The public per-loop bound is 64, so three nested loops legitimately
+  // produce ~64^3 counter combinations (over 1e6 canonical states); the
+  // budget must comfortably cover every script the parser accepts.
+  const STATE_BUDGET = 2_000_000;
+  // Witness detail strings repeat verbatim across the vast majority of the
+  // millions of edges (loop entry/exit text, held-set deltas, ...); intern
+  // them so each distinct wording is retained once.
+  const detailIntern = new Map();
+  const intern = (text) => {
+    const hit = detailIntern.get(text);
+    if (hit !== undefined) return hit;
+    detailIntern.set(text, text);
+    return text;
+  };
+
+  // Nodes are integer ids; parallel arrays replace per-node wrapper objects
+  // and duplicated parent-key strings.
+  const seen = new Map(); // canonical key -> node id
+  let parentIds = new Int32Array(1024);
+  let stepRecs = new Array(1024);
+  let trigRecs = new Array(1024);
+  const ensureCap = (need) => {
+    if (need <= parentIds.length) return;
+    const cap = parentIds.length * 2;
+    const p = new Int32Array(cap);
+    p.set(parentIds);
+    parentIds = p;
+    const oldSteps = stepRecs;
+    const oldTrigs = trigRecs;
+    stepRecs = new Array(cap);
+    trigRecs = new Array(cap);
+    for (let i = 0; i < oldSteps.length; i++) {
+      stepRecs[i] = oldSteps[i];
+      trigRecs[i] = oldTrigs[i];
+    }
+  };
+  let nodeCount = 0;
+  const addNode = (key, parentId, step, trigger) => {
+    ensureCap(nodeCount + 1);
+    parentIds[nodeCount] = parentId;
+    stepRecs[nodeCount] = step;
+    trigRecs[nodeCount] = trigger;
+    seen.set(key, nodeCount);
+    return nodeCount++;
+  };
+  addNode(keyOf(start), -1, null, null);
+
   const queue = [start];
-  const seen = new Map(); // key -> { state, parentKey, step, triggerStep }
-  seen.set(keyOf(start), { state: start, parentKey: null, step: null, triggerStep: null });
+  const queueIds = [0];
   const exits = new Map(); // `${kind}@${trigger}` -> summary
   let edgeCount = 0;
+  let head = 0; // BFS read cursor (avoids O(n^2) queue.shift())
 
-  const releasedOnPath = (key) => {
+  // Recover the cleanup-body releases (token + line) sitting on a witness
+  // path, straight from the compact records.
+  const releasedOnPath = (id) => {
     const out = [];
-    let k = key;
-    while (k) {
-      const node = seen.get(k);
-      if (node.step && node.step.op === 'release' && node.step.phase === 'clean') {
-        out.push({ token: node.step.token, line: node.step.line });
+    let k = id;
+    while (k >= 0) {
+      const rec = stepRecs[k];
+      if (rec && 'pc' in rec && rec.ph === 'clean') {
+        const insAt = instrs[rec.pc];
+        if (insAt.op === 'release') out.push({ token: insAt.token, line: insAt.line });
       }
-      k = node.parentKey;
+      k = parentIds[k];
     }
     return out;
   };
 
-  while (queue.length) {
-    const s = queue.shift();
-    const curKey = keyOf(s);
+  while (head < queue.length) {
+    const s = queue[head];
+    queue[head] = null; // processed states are unreachable otherwise; free them
+    const curId = queueIds[head];
+    head++;
     const res = expand(s);
 
-    if (res.violation) return buildViolation(res.violation, seen, curKey);
+    if (res.violation) return buildViolation(res.violation, curId);
 
     if (res.terminal) {
       const id = `${res.terminal.kind}@${res.terminal.triggerLine == null ? 'end' : res.terminal.triggerLine}`;
@@ -382,7 +432,7 @@ function analyze(rawTokens, rawRows) {
       }
       const rec = exits.get(id);
       rec.canonicalArrivals += 1;
-      for (const r of releasedOnPath(curKey)) rec.released.add(`${r.token}@L${r.line}`);
+      for (const r of releasedOnPath(curId)) rec.released.add(`${r.token}@L${r.line}`);
       continue;
     }
 
@@ -390,19 +440,17 @@ function analyze(rawTokens, rawRows) {
       edgeCount += 1;
       const k = keyOf(e.state);
       if (!seen.has(k)) {
-        if (seen.size >= STATE_BUDGET) {
+        if (nodeCount >= STATE_BUDGET) {
           throw makeError(
             'STATE_BUDGET',
             `穷尽展开超过 ${STATE_BUDGET} 个规范状态（嵌套循环上界乘积过大），请调小循环次数`,
           );
         }
-        seen.set(k, {
-          state: e.state,
-          parentKey: curKey,
-          step: e.step,
-          triggerStep: e.triggerStep || null,
-        });
+        if (e.step && e.step.e && e.step.e.detail) e.step.e.detail = intern(e.step.e.detail);
+        if (e.triggerRaw && e.triggerRaw.detail) e.triggerRaw.detail = intern(e.triggerRaw.detail);
+        const id = addNode(k, curId, e.step, e.triggerRaw || null);
         queue.push(e.state);
+        queueIds.push(id);
       }
     }
   }
@@ -410,7 +458,7 @@ function analyze(rawTokens, rawRows) {
   return {
     safe: true,
     stats: {
-      canonicalStates: seen.size,
+      canonicalStates: nodeCount,
       transitions: edgeCount,
       instructionCount: n,
       tokenCount: tokens.length,
@@ -427,19 +475,74 @@ function analyze(rawTokens, rawRows) {
     instructions: instrs.map(dumpInstr),
   };
 
-  function buildViolation(v, seenMap, curKey) {
+  // Turn a compact stored record back into the full user-facing step object.
+  function materializeStep(rec) {
+    if ('pc' in rec) {
+      const ins = instrs[rec.pc];
+      const e = rec.e || {};
+      const before = rec.m;
+      const after = Object.prototype.hasOwnProperty.call(e, 'after') ? e.after : before;
+      const pendingBefore = rec.p;
+      const pendingAfter = Object.prototype.hasOwnProperty.call(e, 'pa') ? e.pa : pendingBefore;
+      const step = {
+        line: ins.line,
+        op: ins.op,
+        label: OP_LABEL[ins.op],
+        token: ins.token || null,
+        phase: rec.ph,
+        heldBefore: heldNames(before),
+        heldAfter: heldNames(after),
+        pendingBefore: pendingNames(pendingBefore),
+        pendingAfter: pendingNames(pendingAfter),
+      };
+      if (e.branch) step.branch = e.branch;
+      if (e.iteration) step.iteration = e.iteration;
+      if (e.detail) step.detail = e.detail;
+      if (e.outcome) step.outcome = e.outcome;
+      return step;
+    }
+    if ('head' in rec) {
+      return {
+        line: rec.line,
+        op: 'cleanup',
+        label: '展开清理',
+        token: null,
+        phase: 'clean',
+        cleanupExpand: true,
+        heldBefore: heldNames(rec.m),
+        heldAfter: heldNames(rec.m),
+        pendingBefore: pendingNames(rec.p),
+        pendingAfter: pendingNames(rec.pa),
+        detail: rec.detail,
+      };
+    }
+    // Exit marker (return / abort / implicit end).
+    return {
+      line: rec.line,
+      op: rec.kind,
+      label: OP_LABEL[rec.kind],
+      token: null,
+      phase: rec.ph,
+      heldBefore: heldNames(rec.m),
+      heldAfter: heldNames(rec.m),
+      pendingBefore: pendingNames(rec.p),
+      pendingAfter: pendingNames(rec.p),
+      detail: rec.detail,
+    };
+  }
+
+  function buildViolation(v, curId) {
     // Walk leaf -> root; for each node the trigger marker precedes its step.
     const reversed = [];
-    let k = curKey;
-    while (k) {
-      const node = seenMap.get(k);
-      if (node.step) reversed.push(node.step);
-      if (node.triggerStep) reversed.push(node.triggerStep);
-      k = node.parentKey;
+    let k = curId;
+    while (k >= 0) {
+      if (stepRecs[k]) reversed.push(stepRecs[k]);
+      if (trigRecs[k]) reversed.push(trigRecs[k]);
+      k = parentIds[k];
     }
     reversed.reverse();
     if (v.step) reversed.push(v.step);
-    const chain = reversed;
+    const chain = reversed.map(materializeStep);
     chain.forEach((st, i) => { st.seq = i + 1; });
     return {
       safe: false,

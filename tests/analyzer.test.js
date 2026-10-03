@@ -221,3 +221,85 @@ test('清理续体栈在路径中逐步可见', () => {
   assert.deepEqual(reg.pendingBefore, []);
   assert.deepEqual(reg.pendingAfter, ['L1']);
 });
+
+test('回归：三层循环均取公开上界 64（8 条指令，内层获取后立即释放）穷尽安全', () => {
+  // 64 是公开允许的单层循环上界；其三层嵌套乘积为合法输入，旧实现会在
+  // 遍历完所有组合前以 STATE_BUDGET 中止。
+  const r = analyze(['A'], op([
+    { op: 'loop', bound: 64 }, // L1
+    { op: 'loop', bound: 64 }, // L2
+    { op: 'loop', bound: 64 }, // L3
+    { op: 'acquire', token: 'A' }, // L4
+    { op: 'release', token: 'A' }, // L5
+    { op: 'end' },             // L6
+    { op: 'end' },             // L7
+    { op: 'end' },             // L8
+  ]));
+  assert.equal(r.safe, true, '合法的 64×64×64 脚本应穷尽复核为安全，而非 STATE_BUDGET');
+  assert.ok(r.stats.canonicalStates > 120000, '状态数超过旧预算 120000');
+  assert.equal(r.exits.length, 1);
+  assert.equal(r.exits[0].kind, 'implicit');
+  assert.equal(r.exits[0].canonicalArrivals, 1);
+  assert.deepEqual(r.exits[0].released, []);
+});
+
+test('回归：三层 64 循环内层未释放时，最短见证仍在最内层第二轮重复获取', () => {
+  const r = analyze(['A'], op([
+    { op: 'loop', bound: 64 }, // L1
+    { op: 'loop', bound: 64 }, // L2
+    { op: 'loop', bound: 64 }, // L3
+    { op: 'acquire', token: 'A' }, // L4 只获取不释放
+    { op: 'end' },             // L5
+    { op: 'end' },             // L6
+    { op: 'end' },             // L7
+  ]));
+  assert.equal(r.safe, false);
+  assert.equal(r.violation.code, 'DUP_ACQUIRE');
+  assert.equal(r.violation.line, 4);
+  // 最短见证：三层各进入第 1 轮 -> 获取 -> 三层体各结束回头 -> 最内层进入第 2 轮 -> 重复获取
+  const loopSteps = r.steps.filter((s) => s.op === 'loop' && s.iteration);
+  assert.deepEqual(loopSteps.map((s) => s.iteration), [1, 1, 1, 2]);
+  const acquireSteps = r.steps.filter((s) => s.op === 'acquire');
+  assert.equal(acquireSteps.length, 2);
+  assert.deepEqual(acquireSteps[1].heldBefore, ['A']);
+});
+
+test('回归：多层小上界嵌套（4 层 ×4）配对获取/释放安全', () => {
+  const r = analyze(['A'], op([
+    { op: 'loop', bound: 4 },
+    { op: 'loop', bound: 4 },
+    { op: 'loop', bound: 4 },
+    { op: 'loop', bound: 4 },
+    { op: 'acquire', token: 'A' },
+    { op: 'release', token: 'A' },
+    { op: 'end' },
+    { op: 'end' },
+    { op: 'end' },
+    { op: 'end' },
+  ]));
+  assert.equal(r.safe, true);
+  assert.equal(r.exits[0].canonicalArrivals, 1);
+});
+
+test('回归：紧凑存储物化后的清理见证仍保留逐步字段与 LIFO 展开标记', () => {
+  const r = analyze(['A'], op([
+    { op: 'acquire', token: 'A' }, // 1
+    { op: 'cleanup' },             // 2
+    { op: 'release', token: 'A' }, // 3
+    { op: 'end' },                 // 4
+  ]));
+  // 正常流持有 A 到隐式出口 -> 清理展开并释放 -> 安全；这里构造泄漏以便拿到见证链
+  const bad = analyze(['A'], op([
+    { op: 'acquire', token: 'A' },
+    { op: 'cleanup' },
+    { op: 'act', token: 'A' }, // 不释放
+    { op: 'end' },
+  ]));
+  assert.equal(bad.safe, false);
+  const expand = bad.steps.find((s) => s.cleanupExpand === true);
+  assert.ok(expand, '见证中应包含清理展开步');
+  assert.equal(expand.phase, 'clean');
+  assert.deepEqual(expand.heldBefore, ['A']);
+  assert.deepEqual(expand.pendingAfter, []);
+  assert.equal(r.safe, true);
+});

@@ -60,6 +60,8 @@ function request(method, urlPath, body) {
     });
     req.on('error', reject);
     req.on('timeout', () => req.destroy(new Error('请求超时')));
+    // 穷尽复核合法上界脚本（如三层 64 循环约百万级规范状态）可能耗时数秒。
+    req.setTimeout(30000);
     if (body) req.write(body);
     req.end();
   });
@@ -165,6 +167,24 @@ async function main() {
           { op: 'end' },
         ],
         expect: (d) => d.ok && d.result.safe === true && d.result.stats.canonicalStates > 0,
+      },
+      {
+        name: '回归 · 三层循环均取公开上界 64（8 条指令，内层获取后立即释放）穷尽安全',
+        tokens: ['A'],
+        instructions: [
+          { op: 'loop', bound: 64 },
+          { op: 'loop', bound: 64 },
+          { op: 'loop', bound: 64 },
+          { op: 'acquire', token: 'A' },
+          { op: 'release', token: 'A' },
+          { op: 'end' },
+          { op: 'end' },
+          { op: 'end' },
+        ],
+        expect: (d) => d.ok && d.result.safe === true
+          && d.result.exits.length === 1
+          && d.result.exits[0].kind === 'implicit'
+          && d.result.stats.canonicalStates > 120000,
       },
       {
         name: '附加反例 · 循环内获取不释放（第二轮重复获取）',
